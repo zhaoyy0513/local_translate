@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎙️ 实时语音识别</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <style>
+        [x-cloak] { display: none !important; }
+        
+        body {
+            background: #0d1117;
+            font-family: 'Consolas', 'Monaco', monospace;
+        }
+        
+        .log-container {
+            background: #161b22;
+            border: 1px solid #30363d;
+        }
+        
+        .log-item {
+            animation: slideIn 0.3s ease-out;
+            border-left: 2px solid transparent;
+            padding-left: 8px;
+            margin-left: -8px;
+        }
+        
+        .log-item:last-child {
+            border-left-color: #3b82f6;
+        }
+        
+        .scrollbar-dark::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        .scrollbar-dark::-webkit-scrollbar-track {
+            background: #21262d;
+        }
+        
+        .scrollbar-dark::-webkit-scrollbar-thumb {
+            background: #484f58;
+            border-radius: 4px;
+        }
+        
+        .log-scroll-area {
+            height: calc(100vh - 200px);
+            overflow-y: auto;
+            scroll-behavior: smooth;
+        }
+        
+        .log-item-new {
+            animation: slideIn 0.3s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .nav-item:hover { background: #21262d; }
+        .nav-item.active { 
+            background: #1f6feb20; 
+            border-left: 2px solid #58a6ff;
+        }
+        
+        .status-dot {
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        
+        .modal-backdrop {
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+        }
+    </style>
+</head>
+<body class="text-gray-200 min-h-screen" x-data="app()" x-cloak>
+    <div class="flex h-screen">
+        <!-- 左侧导航 -->
+        <nav class="w-56 bg-[#161b22] border-r border-[#30363d] flex flex-col">
+            <div class="p-4 border-b border-[#30363d]">
+                <h1 class="text-lg font-bold text-white">🎙️ 语音识别</h1>
+                <p class="text-xs text-gray-500 mt-1">v1.0</p>
+            </div>
+            
+            <div class="flex-1 py-2">
+                <button 
+                    @click="currentPage = 'live'"
+                    :class="currentPage === 'live' ? 'active' : ''"
+                    class="nav-item w-full text-left px-4 py-2 text-sm flex items-center gap-2"
+                >
+                    <span>📡</span> 实时识别
+                </button>
+                <button 
+                    @click="currentPage = 'history'"
+                    :class="currentPage === 'history' ? 'active' : ''"
+                    class="nav-item w-full text-left px-4 py-2 text-sm flex items-center gap-2"
+                >
+                    <span>📜</span> 历史记录
+                </button>
+            </div>
+            
+            <!-- 状态 -->
+            <div class="p-4 border-t border-[#30363d] text-xs">
+                <div class="flex items-center gap-2 mb-2">
+                    <div 
+                        class="w-2 h-2 rounded-full"
+                        :class="isRunning ? 'bg-green-500 status-dot' : 'bg-gray-600'"
+                    ></div>
+                    <span x-text="isRunning ? '运行中' : '已停止'"></span>
+                </div>
+                <div x-show="currentSession" class="text-gray-500 break-all">
+                    <code x-text="currentSession"></code>
+                </div>
+            </div>
+        </nav>
+        
+        <!-- 右侧内容 -->
+        <main class="flex-1 flex flex-col">
+            <!-- 实时识别页面 -->
+            <template x-if="currentPage === 'live'">
+                <div class="flex-1 flex flex-col p-4 gap-3">
+                    <!-- 控制栏 -->
+                    <div class="flex items-center gap-3">
+                        <button 
+                            @click="start"
+                            :disabled="isRunning || loading"
+                            class="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-700 
+                                   rounded text-sm font-medium disabled:cursor-not-allowed"
+                        >
+                            ▶ 开始
+                        </button>
+                        <button 
+                            @click="stop"
+                            :disabled="!isRunning || loading"
+                            class="px-4 py-2 bg-red-600 hover:bg-red-700 disabled:bg-gray-700 
+                                   rounded text-sm font-medium disabled:cursor-not-allowed"
+                        >
+                            ■ 停止
+                        </button>
+                        <button 
+                            @click="enLogs = []; zhLogs = []"
+                            class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm"
+                        >
+                            清空
+                        </button>
+                    </div>
+                    
+                    <!-- 左右分栏日志 -->
+                    <div class="flex-1 flex gap-3 min-h-0">
+                        <!-- 英文区域 -->
+                        <div class="flex-1 flex flex-col log-container rounded-lg overflow-hidden">
+                            <div class="px-3 py-2 bg-blue-900/50 border-b border-blue-800 flex items-center justify-between">
+                                <span class="text-blue-300 text-sm font-medium">🇬🇧 English</span>
+                                <span class="text-blue-400 text-xs" x-text="enLogs.length + ' 条'"></span>
+                            </div>
+                            <div class="log-scroll-area p-3 scrollbar-dark" x-ref="enLogContainer">
+                                <template x-for="log in enLogs" :key="log.id">
+                                    <div class="log-item mb-2 text-sm">
+                                        <span class="text-gray-500 text-xs" x-text="log.time"></span>
+                                        <p class="text-gray-100 mt-0.5" x-text="log.text"></p>
+                                    </div>
+                                </template>
+                                <div x-show="enLogs.length === 0" class="text-gray-600 text-center py-8 text-sm">
+                                    等待识别...
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- 中文区域 -->
+                        <div class="flex-1 flex flex-col log-container rounded-lg overflow-hidden">
+                            <div class="px-3 py-2 bg-pink-900/50 border-b border-pink-800 flex items-center justify-between">
+                                <span class="text-pink-300 text-sm font-medium">🇨🇳 中文</span>
+                                <span class="text-pink-400 text-xs" x-text="zhLogs.length + ' 条'"></span>
+                            </div>
+                            <div class="log-scroll-area p-3 scrollbar-dark" x-ref="zhLogContainer">
+                                <template x-for="log in zhLogs" :key="log.id">
+                                    <div class="log-item mb-2 text-sm">
+                                        <span class="text-gray-500 text-xs" x-text="log.time"></span>
+                                        <p class="text-gray-100 mt-0.5" x-text="log.text"></p>
+                                    </div>
+                                </template>
+                                <div x-show="zhLogs.length === 0" class="text-gray-600 text-center py-8 text-sm">
+                                    等待翻译...
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </template>
+            
+            <!-- 历史记录页面 -->
+            <template x-if="currentPage === 'history'">
+                <div class="flex-1 flex flex-col p-4 gap-4">
+                    <!-- 查询栏 -->
+                    <div class="flex items-center gap-3">
+                        <select 
+                            x-model="selectedSession"
+                            class="flex-1 px-3 py-2 bg-[#21262d] border border-[#30363d] 
+                                   rounded text-sm focus:outline-none focus:border-blue-500"
+                        >
+                            <option value="">选择会话...</option>
+                            <template x-for="s in sessions" :key="s">
+                                <option :value="s" x-text="s"></option>
+                            </template>
+                        </select>
+                        <button 
+                            @click="loadSessions"
+                            class="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm"
+                        >
+                            刷新
+                        </button>
+                        <button 
+                            @click="queryHistory"
+                            :disabled="!selectedSession"
+                            class="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 
+                                   rounded text-sm disabled:cursor-not-allowed"
+                        >
+                            查询
+                        </button>
+                        <div class="border-l border-gray-600 h-6"></div>
+                        <button 
+                            @click="showExportModal = true"
+                            :disabled="!selectedSession"
+                            class="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-700 
+                                   rounded text-sm disabled:cursor-not-allowed"
+                        >
+                            📥 导出
+                        </button>
+                    </div>
+                    
+                    <!-- 历史记录输出 -->
+                    <div class="flex-1 log-container rounded-lg p-4 overflow-y-auto scrollbar-dark">
+                        <template x-for="log in historyLogs" :key="log.id">
+                            <div class="log-item mb-2 text-sm font-mono">
+                                <span class="text-gray-500" x-text="log.time"></span>
+                                <span 
+                                    class="ml-2 px-1 rounded text-xs"
+                                    :class="log.lang === 'en' ? 'bg-blue-900 text-blue-300' : 'bg-pink-900 text-pink-300'"
+                                    x-text="log.lang === 'en' ? 'EN' : 'ZH'"
+                                ></span>
+                                <span class="ml-2 text-gray-100" x-text="log.text"></span>
+                            </div>
+                        </template>
+                        
+                        <div x-show="historyLogs.length === 0" class="text-gray-600 text-center py-20">
+                            选择会话并查询
+                        </div>
+                    </div>
+                </div>
+            </template>
+        </main>
+    </div>
+    
+    <!-- 导出弹窗 -->
+    <div 
+        x-show="showExportModal" 
+        x-transition:enter="transition ease-out duration-200"
+        x-transition:enter-start="opacity-0"
+        x-transition:enter-end="opacity-100"
+        x-transition:leave="transition ease-in duration-150"
+        x-transition:leave-start="opacity-100"
+        x-transition:leave-end="opacity-0"
+        class="fixed inset-0 z-50 flex items-center justify-center modal-backdrop"
+        @click.self="showExportModal = false"
+    >
+        <div 
+            class="bg-[#161b22] border border-[#30363d] rounded-lg shadow-2xl w-96 p-6"
+            x-transition:enter="transition ease-out duration-200"
+            x-transition:enter-start="opacity-0 scale-95"
+            x-transition:enter-end="opacity-100 scale-100"
+        >
+            <h3 class="text-lg font-bold text-white mb-4">📥 导出会话记录</h3>
+            
+            <!-- 语言选择 -->
+            <div class="mb-4">
+                <label class="block text-sm text-gray-400 mb-2">选择内容</label>
+                <div class="space-y-2">
+                    <label class="flex items-center gap-3 p-2 rounded hover:bg-[#21262d] cursor-pointer">
+                        <input type="radio" x-model="exportLang" value="en" class="accent-blue-500">
+                        <span class="text-blue-300">🇬🇧 English Only</span>
+                        <span class="text-xs text-gray-500 ml-auto">仅英文</span>
+                    </label>
+                    <label class="flex items-center gap-3 p-2 rounded hover:bg-[#21262d] cursor-pointer">
+                        <input type="radio" x-model="exportLang" value="zh" class="accent-pink-500">
+                        <span class="text-pink-300">🇨🇳 中文 Only</span>
+                        <span class="text-xs text-gray-500 ml-auto">仅中文</span>
+                    </label>
+                    <label class="flex items-center gap-3 p-2 rounded hover:bg-[#21262d] cursor-pointer">
+                        <input type="radio" x-model="exportLang" value="both" class="accent-purple-500">
+                        <span class="text-purple-300">🌍 English + 中文</span>
+                        <span class="text-xs text-gray-500 ml-auto">按时间排序</span>
+                    </label>
+                </div>
+            </div>
+            
+            <!-- 格式选择 -->
+            <div class="mb-6">
+                <label class="block text-sm text-gray-400 mb-2">导出格式</label>
+                <div class="flex gap-3">
+                    <label class="flex-1 flex items-center justify-center gap-2 p-3 rounded border cursor-pointer"
+                           :class="exportFormat === 'txt' ? 'border-green-500 bg-green-900/20' : 'border-[#30363d] hover:border-gray-500'">
+                        <input type="radio" x-model="exportFormat" value="txt" class="hidden">
+                        <span>📄</span>
+                        <span>TXT</span>
+                    </label>
+                    <label class="flex-1 flex items-center justify-center gap-2 p-3 rounded border cursor-pointer"
+                           :class="exportFormat === 'json' ? 'border-yellow-500 bg-yellow-900/20' : 'border-[#30363d] hover:border-gray-500'">
+                        <input type="radio" x-model="exportFormat" value="json" class="hidden">
+                        <span>📦</span>
+                        <span>JSON</span>
+                    </label>
+                </div>
+            </div>
+            
+            <!-- 按钮 -->
+            <div class="flex gap-3">
+                <button 
+                    @click="showExportModal = false"
+                    class="flex-1 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm"
+                >
+                    取消
+                </button>
+                <button 
+                    @click="doExport"
+                    class="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium"
+                >
+                    导出
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function app() {
+            return {
+                apiBase: 'http://localhost:8000/api',
+                wsUrl: 'ws://localhost:8000/ws',
+                ws: null,
+                
+                currentPage: 'live',
+                isRunning: false,
+                loading: false,
+                currentSession: null,
+                
+                enLogs: [],
+                zhLogs: [],
+                logId: 0,
+                
+                sessions: [],
+                selectedSession: '',
+                historyLogs: [],
+                
+                // 导出弹窗
+                showExportModal: false,
+                exportLang: 'both',
+                exportFormat: 'txt',
+                
+                async init() {
+                    await this.checkStatus();
+                    await this.loadSessions();
+                    this.connectWs();
+                },
+                
+                connectWs() {
+                    this.ws = new WebSocket(this.wsUrl);
+                    
+                    this.ws.onmessage = (e) => {
+                        const data = JSON.parse(e.data);
+                        this.addLog(data.lang, data.text, data.timestamp);
+                    };
+                    
+                    this.ws.onclose = () => {
+                        setTimeout(() => this.connectWs(), 2000);
+                    };
+                },
+                
+                addLog(lang, text, timestamp) {
+                    const time = new Date(timestamp).toLocaleTimeString('zh-CN', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit'
+                    });
+                    const log = { id: this.logId++, text, time };
+                    
+                    if (lang === 'en') {
+                        this.enLogs.push(log);
+                        // 只保留最新 50 条 (旧数据自动消失)
+                        while (this.enLogs.length > 50) this.enLogs.shift();
+                    } else {
+                        this.zhLogs.push(log);
+                        while (this.zhLogs.length > 50) this.zhLogs.shift();
+                    }
+                    
+                    // 强制滚动到底部
+                    this.$nextTick(() => {
+                        const enC = this.$refs.enLogContainer;
+                        const zhC = this.$refs.zhLogContainer;
+                        if (enC) enC.scrollTop = enC.scrollHeight;
+                        if (zhC) zhC.scrollTop = zhC.scrollHeight;
+                    });
+                },
+                
+                async checkStatus() {
+                    try {
+                        const res = await fetch(`${this.apiBase}/translation/status`);
+                        const data = await res.json();
+                        if (data.success) {
+                            this.isRunning = data.data.is_running;
+                            this.currentSession = data.data.current_session;
+                        }
+                    } catch (e) {}
+                },
+                
+                async start() {
+                    this.loading = true;
+                    try {
+                        const res = await fetch(`${this.apiBase}/translation/start`, { method: 'POST' });
+                        const data = await res.json();
+                        if (data.success) {
+                            this.isRunning = true;
+                            this.currentSession = data.data.session_key;
+                            this.enLogs = [];
+                            this.zhLogs = [];
+                        }
+                    } catch (e) {
+                        alert('启动失败: ' + e.message);
+                    }
+                    this.loading = false;
+                },
+                
+                async stop() {
+                    this.loading = true;
+                    try {
+                        const res = await fetch(`${this.apiBase}/translation/stop`, { method: 'POST' });
+                        const data = await res.json();
+                        if (data.success) {
+                            this.isRunning = false;
+                        }
+                    } catch (e) {
+                        alert('停止失败: ' + e.message);
+                    }
+                    this.loading = false;
+                },
+                
+                async loadSessions() {
+                    try {
+                        const res = await fetch(`${this.apiBase}/sessions`);
+                        const data = await res.json();
+                        if (data.success) {
+                            this.sessions = data.data.sessions;
+                        }
+                    } catch (e) {}
+                },
+                
+                async queryHistory() {
+                    if (!this.selectedSession) return;
+                    
+                    this.historyLogs = [];
+                    
+                    try {
+                        // 获取英文记录
+                        const enRes = await fetch(`${this.apiBase}/records/${this.selectedSession}/en?count=200`);
+                        const enData = await enRes.json();
+                        
+                        // 获取中文记录
+                        const zhRes = await fetch(`${this.apiBase}/records/${this.selectedSession}/zh?count=200`);
+                        const zhData = await zhRes.json();
+                        
+                        // 厄记录不存在时的错误
+                        const enRecords = enData.records || [];
+                        const zhRecords = zhData.records || [];
+                        
+                        // 合并并按时间排序
+                        const all = [
+                            ...enRecords.map(r => ({ ...r, lang: 'en' })),
+                            ...zhRecords.map(r => ({ ...r, lang: 'zh' })),
+                        ].sort((a, b) => a.timestamp - b.timestamp);
+                        
+                        this.historyLogs = all.map((r, i) => ({
+                            id: i,
+                            lang: r.lang,
+                            text: r.text,
+                            time: new Date(r.timestamp).toLocaleTimeString('zh-CN'),
+                        }));
+                        
+                        if (all.length === 0) {
+                            alert('该会话没有记录');
+                        }
+                        
+                    } catch (e) {
+                        alert('查询失败: ' + e.message);
+                    }
+                },
+                
+                doExport() {
+                    if (!this.selectedSession) return;
+                    
+                    const url = `${this.apiBase}/export/${this.selectedSession}?format=${this.exportFormat}&lang=${this.exportLang}`;
+                    window.open(url, '_blank');
+                    this.showExportModal = false;
+                },
+            }
+        }
+    </script>
+</body>
+</html>
