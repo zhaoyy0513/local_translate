@@ -1,0 +1,47 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# ===== Virtual Environment =====
+venv/
+.env/
+.env.*
+.venv/
+
+# ===== FastAPI / Uvicorn =====
+*.log
+logs/
+uvicorn.log
+
+# ===== Pytest / Coverage =====
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# ===== IDE =====
+.idea/
+.vscode/
+*.iml
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== Build =====
+build/
+dist/
+*.egg-info/
+
+# ===== Database / Local files =====
+*.db
+*.sqlite3
+
+# ===== Secrets =====
+secret*.yml
+secret*.yaml
+config*.yml
+config*.yaml
