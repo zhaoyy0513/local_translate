@@ -1,16 +1,23 @@
 """
-音频捕获与识别服务
+音频捕获与识别服务（sherpa-onnx 流式版）
+
+核心特性：
+- sherpa-onnx Zipformer 流式模型：准确度接近 Whisper，真实时流式
+- 每 100ms 出 partial result（边说边出字）
+- 内置 endpoint detection（自动检测句子结束）
+- WebSocket 推送 partial + final 两种消息
 """
 import asyncio
+import json
 import logging
-import queue
+import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import tarfile
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pyaudio
-from faster_whisper import WhisperModel
 
 from backend.config import settings
 from backend.models import RecognitionRecord
@@ -20,40 +27,101 @@ from backend.services.translator import translator_service
 # WebSocket 连接管理
 active_connections: list = []
 
-# 线程池用于处理异步操作
-executor = ThreadPoolExecutor(max_workers=2)
-
 logger = logging.getLogger(__name__)
+
+# sherpa-onnx 模型配置
+MODEL_NAME = "sherpa-onnx-streaming-zipformer-en-2023-06-26"
+MODEL_URL = f"https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{MODEL_NAME}.tar.bz2"
+# 备用镜像 (HuggingFace)
+MODEL_URL_HF = f"https://huggingface.co/csukuangfj/{MODEL_NAME}/resolve/main/encoder-epoch-99-avg-1-chunk-16-left-128.onnx"
+MODEL_DIR = Path(__file__).parent.parent.parent / "models"
+
+
+def _ensure_model() -> Path:
+    """确保 sherpa-onnx 模型已下载，返回模型目录"""
+    model_path = MODEL_DIR / MODEL_NAME
+    
+    # 检查模型文件是否存在
+    encoder = model_path / "encoder-epoch-99-avg-1-chunk-16-left-128.onnx"
+    if encoder.exists():
+        return model_path
+    
+    # 检查是否有其他 sherpa 模型
+    if MODEL_DIR.exists():
+        for d in MODEL_DIR.iterdir():
+            if d.is_dir() and d.name.startswith("sherpa-onnx-streaming"):
+                # 找到 encoder 文件
+                encoders = list(d.glob("encoder*.onnx"))
+                if encoders:
+                    logger.info("Found existing model: %s", d.name)
+                    return d
+    
+    # 下载模型
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    tar_path = MODEL_DIR / f"{MODEL_NAME}.tar.bz2"
+    
+    logger.info("=" * 60)
+    logger.info("Downloading sherpa-onnx model: %s", MODEL_NAME)
+    logger.info("This is a one-time download (~300MB), please wait...")
+    logger.info("URL: %s", MODEL_URL)
+    logger.info("=" * 60)
+    
+    import requests
+    
+    try:
+        response = requests.get(MODEL_URL, stream=True, timeout=30)
+        response.raise_for_status()
+    except Exception as e:
+        logger.warning("GitHub download failed (%s), trying alternative...", e)
+        # 如果 GitHub 下载失败，提示用户手动下载
+        raise RuntimeError(
+            f"模型下载失败。请手动下载模型：\n"
+            f"1. 访问 https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models\n"
+            f"2. 下载 {MODEL_NAME}.tar.bz2\n"
+            f"3. 解压到 {MODEL_DIR}\n"
+        ) from e
+    
+    total = int(response.headers.get("content-length", 0))
+    downloaded = 0
+    
+    with open(tar_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=65536):
+            f.write(chunk)
+            downloaded += len(chunk)
+            if total and downloaded % (20 * 1024 * 1024) < 65536:
+                logger.info("Download: %.0f%% (%dMB / %dMB)",
+                    downloaded / total * 100,
+                    downloaded // (1024 * 1024),
+                    total // (1024 * 1024),
+                )
+    
+    logger.info("Extracting model...")
+    with tarfile.open(tar_path, "r:bz2") as tf:
+        tf.extractall(MODEL_DIR)
+    
+    tar_path.unlink()
+    logger.info("Model ready: %s", model_path)
+    
+    return model_path
 
 
 class AudioCaptureService:
-    """音频捕捉与实时翻译服务"""
+    """音频捕捉与实时翻译服务（sherpa-onnx 流式）"""
     
     def __init__(self) -> None:
         self._is_running = False
         self._session_key: str | None = None
         self._audio_thread: threading.Thread | None = None
-        self._translate_thread: threading.Thread | None = None
-        self._model: WhisperModel | None = None
         self._device_index: int | None = None
-        
-        # 翻译队列 (异步处理)
-        self._translate_queue: queue.Queue = queue.Queue()
+        self._loop: asyncio.AbstractEventLoop | None = None
         
         # PyAudio 配置
         self._format = pyaudio.paInt16
         self._channels = 2  # 立体声
         self._rate = settings.sample_rate
-        self._chunk_size = int(self._rate * settings.chunk_duration)
     
     def _detect_audio_device(self) -> tuple[int | None, int]:
-        """
-        获取音频设备
-        
-        Returns:
-            (device_index, sample_rate)
-        """
-        # 如果配置了设备索引,直接使用
+        """获取音频设备"""
         if settings.audio_device_index is not None:
             logger.info(
                 "Using configured audio device index: %d (rate: %d Hz)",
@@ -64,265 +132,282 @@ class AudioCaptureService:
         
         audio = pyaudio.PyAudio()
         try:
-            # 查找包含关键字的设备 (优先 WASAPI)
             keywords = [
-                "stereo mix",
-                "立体声混音",
-                "loopback",
-                "what u hear",
-                "wave out mix",
+                "stereo mix", "立体声混音", "loopback",
+                "what u hear", "wave out mix",
             ]
-            
             candidates = []
             
             for i in range(audio.get_device_count()):
                 info = audio.get_device_info_by_index(i)
-                
-                # 必须是输入设备
                 if info["maxInputChannels"] < 1:
                     continue
-                
                 device_name = info["name"].lower()
                 host_api = audio.get_host_api_info_by_index(info["hostApi"])["name"]
-                
-                # 匹配关键字
                 for keyword in keywords:
                     if keyword in device_name:
-                        # 优先选择 WASAPI 设备
                         priority = 1 if "WASAPI" in host_api else 2
                         candidates.append((priority, i, info))
                         break
             
             if candidates:
-                # 按优先级排序
                 candidates.sort(key=lambda x: x[0])
                 _, device_index, info = candidates[0]
-                
                 sample_rate = int(info["defaultSampleRate"])
-                
                 logger.info(
-                    "Auto-detected audio device: [%d] %s (Rate: %d Hz)",
-                    device_index,
-                    info["name"],
-                    sample_rate,
+                    "Auto-detected: [%d] %s (Rate: %d Hz)",
+                    device_index, info["name"], sample_rate,
                 )
-                
                 return device_index, sample_rate
             
-            # 如果没找到,使用默认设备
-            logger.warning(
-                "Stereo Mix not found, using default input device. "
-                "You may need to enable 'Stereo Mix' in Windows Sound settings."
-            )
+            logger.warning("Stereo Mix not found, using default input device.")
             return None, settings.sample_rate
-            
         finally:
             audio.terminate()
     
-    def _load_model(self) -> None:
-        """延迟加载 Whisper 模型"""
-        if self._model is None:
-            logger.info("Loading Whisper model: %s", settings.whisper_model)
-            self._model = WhisperModel(
-                settings.whisper_model,
-                device=settings.whisper_device,
-                compute_type=settings.whisper_compute_type,
+    def _schedule_async(self, coro) -> None:
+        """将协程投递到主 event loop"""
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(coro, self._loop)
+    
+    async def _save_and_broadcast(self, record: RecognitionRecord, msg_type: str) -> None:
+        """并发 Redis 保存 + WebSocket 推送"""
+        message = {
+            "type": msg_type,
+            "lang": record.lang,
+            "text": record.text,
+            "timestamp": record.timestamp,
+        }
+        await asyncio.gather(
+            redis_client.save_recognition(record),
+            self._broadcast(message),
+        )
+    
+    async def _broadcast_partial(self, text: str) -> None:
+        """推送 partial result（不保存到 Redis）"""
+        message = {
+            "type": "partial",
+            "lang": "en",
+            "text": text,
+            "timestamp": int(datetime.now().timestamp() * 1000),
+        }
+        await self._broadcast(message)
+    
+    async def _translate_and_save(self, text: str, timestamp: int) -> None:
+        """异步翻译 + 保存 + 推送"""
+        try:
+            translated = await translator_service.translate(text)
+            if not translated:
+                return
+            
+            logger.info("Translated: %s -> %s", text, translated)
+            
+            zh_record = RecognitionRecord.create(
+                text=translated,
+                session_key=self._session_key,
+                lang="zh",
             )
-            logger.info("Model loaded successfully")
-    
-    def _translate_worker(self) -> None:
-        """翻译工作线程 (异步处理翻译)"""
-        logger.info("Translation worker started")
-        
-        while self._is_running or not self._translate_queue.empty():
-            try:
-                # 从队列获取任务 (超时 1 秒)
-                item = self._translate_queue.get(timeout=1)
-                
-                text = item["text"]
-                timestamp = item["timestamp"]
-                
-                # 翻译
-                try:
-                    translated = translator_service.translate(text)
-                    logger.info("Translated: %s -> %s", text, translated)
-                    
-                    # 保存中文记录
-                    zh_record = RecognitionRecord.create(
-                        text=translated,
-                        session_key=self._session_key,
-                        lang="zh",
-                    )
-                    zh_record.timestamp = timestamp  # 使用同一时间戳
-                    
-                    self._run_async_in_thread(
-                        redis_client.save_recognition(zh_record)
-                    )
-                    
-                    # WebSocket 推送
-                    self._run_async_in_thread(
-                        self._broadcast({
-                            "type": "translation",
-                            "lang": "zh",
-                            "text": translated,
-                            "timestamp": timestamp,
-                        })
-                    )
-                    
-                except Exception as e:
-                    logger.error("Translation failed: %s", e)
-                
-                self._translate_queue.task_done()
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error("Translation worker error: %s", e)
-        
-        logger.info("Translation worker stopped")
-    
-    def _run_async_in_thread(self, coro):
-        """在新线程中运行异步函数"""
-        def run():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(coro)
-            finally:
-                loop.close()
-        
-        future = executor.submit(run)
-        return future
+            zh_record.timestamp = timestamp
+            
+            await self._save_and_broadcast(zh_record, "translation")
+        except Exception as e:
+            logger.error("Translation failed: %s", e)
     
     async def _broadcast(self, message: dict) -> None:
         """广播消息到所有 WebSocket 连接"""
-        import json
+        data = json.dumps(message, ensure_ascii=False)
         disconnected = []
-        
         for connection in active_connections:
             try:
-                await connection.send_text(json.dumps(message, ensure_ascii=False))
-            except Exception as e:
-                logger.error("Failed to send message: %s", e)
+                await connection.send_text(data)
+            except Exception:
                 disconnected.append(connection)
-        
-        # 清理断开的连接
         for conn in disconnected:
-            active_connections.remove(conn)
+            if conn in active_connections:
+                active_connections.remove(conn)
+    
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """将全大写的模型输出转为正常大小写"""
+        if not text:
+            return text
+        # 全小写后，首字母大写
+        text = text.lower().strip()
+        if text:
+            text = text[0].upper() + text[1:]
+        return text
     
     def _capture_and_process(self) -> None:
-        """音频捕捉线程主函数"""
+        """
+        音频捕捉线程 — sherpa-onnx 流式识别
+        
+        每 100ms 读取音频 → 喂给 recognizer →
+        partial result 实时推送 →
+        endpoint 检测到句子结束 → final result 保存+翻译
+        """
+        import sherpa_onnx
+        
+        # 加载模型
+        model_path = _ensure_model()
+        logger.info("Loading sherpa-onnx model from: %s", model_path)
+        
+        # 查找模型文件
+        encoders = sorted(model_path.glob("encoder*.onnx"))
+        decoders = sorted(model_path.glob("decoder*.onnx"))
+        joiners = sorted(model_path.glob("joiner*.onnx"))
+        tokens = model_path / "tokens.txt"
+        
+        if not encoders or not decoders or not joiners or not tokens.exists():
+            raise RuntimeError(
+                f"模型文件不完整。需要 encoder/decoder/joiner .onnx + tokens.txt\n"
+                f"模型目录: {model_path}"
+            )
+        
+        # 创建 recognizer
+        recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+            tokens=str(tokens),
+            encoder=str(encoders[0]),
+            decoder=str(decoders[0]),
+            joiner=str(joiners[0]),
+            num_threads=4,
+            sample_rate=16000,
+            feature_dim=80,
+            enable_endpoint_detection=True,
+            rule1_min_trailing_silence=2.4,   # 纯静音 2.4s → endpoint
+            rule2_min_trailing_silence=0.8,   # 说了话后 0.8s 静音 → endpoint
+            rule3_min_utterance_length=20.0,  # 超长句子 20s → endpoint
+            decoding_method="greedy_search",
+        )
+        
+        stream = recognizer.create_stream()
+        
+        logger.info("sherpa-onnx recognizer ready")
+        
         audio = pyaudio.PyAudio()
         
+        # 每次读取 100ms 音频
+        vosk_rate = 16000
+        read_duration = 0.1  # 100ms
+        read_frames = int(self._rate * read_duration)
+        
+        # 重采样参数
+        need_resample = self._rate != vosk_rate
+        if need_resample:
+            from math import gcd
+            from scipy.signal import resample_poly
+            g = gcd(self._rate, vosk_rate)
+            resample_up = vosk_rate // g
+            resample_down = self._rate // g
+            logger.info(
+                "Resampling: %d -> %d Hz (up=%d, down=%d)",
+                self._rate, vosk_rate, resample_up, resample_down,
+            )
+        
         try:
-            # 打开音频流 (使用检测到的设备)
             stream_params = {
                 "format": self._format,
                 "channels": self._channels,
                 "rate": self._rate,
                 "input": True,
-                "frames_per_buffer": 1024,
+                "frames_per_buffer": read_frames,
             }
             
             if self._device_index is not None:
                 stream_params["input_device_index"] = self._device_index
                 logger.info("Using audio device index: %d", self._device_index)
-            else:
-                logger.info("Using default audio device")
             
-            stream = audio.open(**stream_params)
+            audio_stream = audio.open(**stream_params)
+            logger.info(
+                "Streaming started (read=%dms, rate=%d->%d Hz)",
+                int(read_duration * 1000), self._rate, vosk_rate,
+            )
             
-            logger.info("Audio capture started")
+            last_partial = ""
             
             while self._is_running:
-                # 读取音频块
-                frames = []
-                for _ in range(0, int(self._rate / 1024 * settings.chunk_duration)):
-                    if not self._is_running:
-                        break
-                    data = stream.read(1024, exception_on_overflow=False)
-                    frames.append(data)
+                # 读取 100ms 音频
+                data = audio_stream.read(read_frames, exception_on_overflow=False)
                 
-                if not frames:
-                    continue
+                # 转 numpy int16
+                audio_int16 = np.frombuffer(data, dtype=np.int16)
                 
-                # 转换为 numpy 数组
-                audio_data = np.frombuffer(b"".join(frames), dtype=np.int16)
-                
-                # 如果是立体声,转为单声道 (取平均)
+                # 立体声转单声道
                 if self._channels == 2:
-                    audio_data = audio_data.reshape(-1, 2).mean(axis=1).astype(np.int16)
+                    audio_int16 = audio_int16.reshape(-1, 2).mean(axis=1).astype(np.int16)
                 
-                audio_float = audio_data.astype(np.float32) / 32768.0
+                # 转 float32 (sherpa-onnx 需要 [-1, 1] 范围的 float)
+                audio_float = audio_int16.astype(np.float32) / 32768.0
                 
-                # 简单 VAD: 检测音量
-                volume = np.abs(audio_float).mean()
-                logger.debug("Audio volume: %.4f", volume)
-                if volume < 0.005:  # 静音阈值 (降低)
-                    continue
+                # 重采样到 16kHz
+                if need_resample:
+                    audio_float = resample_poly(
+                        audio_float, resample_up, resample_down,
+                    ).astype(np.float32)
                 
-                # 重采样到 16000 Hz (Whisper 需要)
-                if self._rate != 16000:
-                    # 简单的重采样: 按比例取样
-                    ratio = 16000 / self._rate
-                    new_length = int(len(audio_float) * ratio)
-                    indices = np.linspace(0, len(audio_float) - 1, new_length).astype(int)
-                    audio_float = audio_float[indices]
+                # 喂给 recognizer
+                stream.accept_waveform(vosk_rate, audio_float)
                 
-                # 语音识别 (简化参数,提高稳定性)
-                try:
-                    segments, info = self._model.transcribe(
-                        audio_float,
-                        language="en",
-                        beam_size=5,
-                        vad_filter=True,
+                while recognizer.is_ready(stream):
+                    recognizer.decode_stream(stream)
+                
+                # 获取当前识别结果
+                current_text = self._normalize_text(recognizer.get_result(stream))
+                
+                is_endpoint = recognizer.is_endpoint(stream)
+                
+                if is_endpoint and current_text:
+                    # === Final: 句子说完了 ===
+                    logger.info("Final: %s", current_text)
+                    
+                    en_record = RecognitionRecord.create(
+                        text=current_text,
+                        session_key=self._session_key,
+                        lang="en",
                     )
                     
-                    for segment in segments:
-                        text = segment.text.strip()
-                        if not text:
-                            continue
-                        
-                        logger.info("Recognized: %s", text)
-                        
-                        # 保存英文记录
-                        try:
-                            en_record = RecognitionRecord.create(
-                                text=text,
-                                session_key=self._session_key,
-                                lang="en",
-                            )
-                            
-                            # 保存到 Redis
-                            self._run_async_in_thread(
-                                redis_client.save_recognition(en_record)
-                            )
-                            
-                            # WebSocket 推送
-                            self._run_async_in_thread(
-                                self._broadcast({
-                                    "type": "recognition",
-                                    "lang": "en",
-                                    "text": text,
-                                    "timestamp": en_record.timestamp,
-                                })
-                            )
-                            
-                            # 加入翻译队列 (异步处理,不阻塞识别)
-                            if settings.enable_translation:
-                                self._translate_queue.put({
-                                    "text": text,
-                                    "timestamp": en_record.timestamp,
-                                })
-                            
-                        except Exception as e:
-                            logger.error("Save English failed: %s", e)
-                
-                except Exception as e:
-                    logger.error("Transcription failed: %s", e)
+                    self._schedule_async(
+                        self._save_and_broadcast(en_record, "recognition")
+                    )
+                    
+                    if settings.enable_translation:
+                        self._schedule_async(
+                            self._translate_and_save(current_text, en_record.timestamp)
+                        )
+                    
+                    recognizer.reset(stream)
+                    last_partial = ""
+                    
+                elif is_endpoint and not current_text:
+                    # 空 endpoint，重置
+                    recognizer.reset(stream)
+                    last_partial = ""
+                    
+                elif current_text and current_text != last_partial:
+                    # === Partial: 正在说话，实时更新 ===
+                    last_partial = current_text
+                    self._schedule_async(
+                        self._broadcast_partial(current_text)
+                    )
             
-            stream.stop_stream()
-            stream.close()
+            # 处理剩余
+            tail_text = recognizer.get_result(stream).strip()
+            if tail_text:
+                logger.info("Final (flush): %s", tail_text)
+                en_record = RecognitionRecord.create(
+                    text=tail_text,
+                    session_key=self._session_key,
+                    lang="en",
+                )
+                self._schedule_async(
+                    self._save_and_broadcast(en_record, "recognition")
+                )
+                if settings.enable_translation:
+                    self._schedule_async(
+                        self._translate_and_save(tail_text, en_record.timestamp)
+                    )
+            
+            audio_stream.stop_stream()
+            audio_stream.close()
             
         except Exception as e:
             logger.error("Audio capture error: %s", e)
@@ -332,45 +417,29 @@ class AudioCaptureService:
             logger.info("Audio capture stopped")
     
     def start_capture(self) -> str:
-        """
-        开始音频捕获
-        
-        Returns:
-            session_key
-            
-        Raises:
-            RuntimeError: 已在运行中
-        """
+        """开始音频捕获"""
         if self._is_running:
             raise RuntimeError("Capture already running")
         
-        # 生成 session_key (格式: 2026_02_11_14_30_1707621643000)
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
+            logger.warning("No running event loop")
+        
         now = datetime.now()
         timestamp_ms = int(now.timestamp() * 1000)
         self._session_key = now.strftime(f"%Y_%m_%d_%H_%M_{timestamp_ms}")
         
-        # 检测音频设备
         self._device_index, self._rate = self._detect_audio_device()
         logger.info("Using sample rate: %d Hz", self._rate)
         
-        # 加载模型
-        self._load_model()
-        
-        # 启动音频捕捉线程
         self._is_running = True
         self._audio_thread = threading.Thread(
             target=self._capture_and_process,
             daemon=True,
         )
         self._audio_thread.start()
-        
-        # 启动翻译线程
-        if settings.enable_translation:
-            self._translate_thread = threading.Thread(
-                target=self._translate_worker,
-                daemon=True,
-            )
-            self._translate_thread.start()
         
         logger.info("Started capture with session: %s", self._session_key)
         return self._session_key
@@ -382,26 +451,18 @@ class AudioCaptureService:
         
         self._is_running = False
         
-        # 等待音频线程
         if self._audio_thread:
             self._audio_thread.join(timeout=5)
-        
-        # 等待翻译队列清空
-        if self._translate_thread:
-            self._translate_queue.join()  # 等待所有任务完成
-            self._translate_thread.join(timeout=10)
         
         logger.info("Stopped capture for session: %s", self._session_key)
         self._session_key = None
     
     @property
     def is_running(self) -> bool:
-        """是否正在运行"""
         return self._is_running
     
     @property
     def current_session(self) -> str | None:
-        """当前会话key"""
         return self._session_key
 
 

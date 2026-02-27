@@ -14,6 +14,7 @@ from backend.config import settings
 from backend.models import QueryRequest, TranslationResponse, RecognitionRecord
 from backend.services.audio_capture import audio_service, active_connections
 from backend.services.redis_client import redis_client
+from backend.services.translator import translator_service
 
 # 配置日志
 logging.basicConfig(
@@ -37,6 +38,8 @@ async def lifespan(app: FastAPI):
     # 关闭时
     logger.info("Stopping audio capture...")
     audio_service.stop_capture()
+    logger.info("Closing translator...")
+    await translator_service.close()
     logger.info("Disconnecting from Redis...")
     await redis_client.disconnect()
     logger.info("Application shutdown complete")
@@ -158,20 +161,34 @@ async def query_records(
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
 
-@app.get("/api/sessions", response_model=TranslationResponse)
+@app.get("/api/sessions")
 async def list_sessions():
     """列出所有会话"""
     try:
         sessions = await redis_client.list_sessions()
-        return TranslationResponse(
-            success=True,
-            message="ok",
-            data={"sessions": sessions},
-        )
+        return {
+            "success": True,
+            "data": {"sessions": sessions},
+        }
     
     except Exception as e:
         logger.error("Failed to list sessions: %s", e)
         raise HTTPException(status_code=500, detail=f"获取会话列表失败: {str(e)}")
+
+
+@app.delete("/api/sessions/{session_key}")
+async def delete_session(session_key: str):
+    """删除会话"""
+    try:
+        await redis_client.delete_session(session_key)
+        return {
+            "success": True,
+            "message": f"会话 {session_key} 已删除",
+        }
+    
+    except Exception as e:
+        logger.error("Failed to delete session: %s", e)
+        raise HTTPException(status_code=500, detail=f"删除失败: {str(e)}")
 
 
 @app.websocket("/ws")

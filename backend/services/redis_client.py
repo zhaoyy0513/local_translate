@@ -111,12 +111,12 @@ class RedisClient:
         
         return total, records
     
-    async def list_sessions(self) -> list[str]:
+    async def list_sessions(self) -> list[dict]:
         """
-        列出所有会话
+        列出所有会话（含记录数）
         
         Returns:
-            会话key列表
+            [{"session_key": "...", "en_count": N, "zh_count": N}, ...]
         """
         if not self._client:
             raise RuntimeError("Redis client not connected")
@@ -124,11 +124,40 @@ class RedisClient:
         # 使用 SCAN 遍历 key (避免 KEYS 阻塞)
         sessions_set = set()
         async for key in self._client.scan_iter(match="session:*:en", count=100):
-            # 提取 session_key (session:2026_02_11_14_30:en -> 2026_02_11_14_30)
             session_key = key.replace("session:", "").replace(":en", "")
             sessions_set.add(session_key)
         
-        return sorted(list(sessions_set), reverse=True)
+        # 也扫描 zh key，防止有的 session 只有中文记录
+        async for key in self._client.scan_iter(match="session:*:zh", count=100):
+            session_key = key.replace("session:", "").replace(":zh", "")
+            sessions_set.add(session_key)
+        
+        result = []
+        for sk in sorted(sessions_set, reverse=True):
+            en_count = await self._client.xlen(f"session:{sk}:en")
+            zh_count = await self._client.xlen(f"session:{sk}:zh")
+            result.append({
+                "session_key": sk,
+                "en_count": en_count,
+                "zh_count": zh_count,
+            })
+        
+        return result
+    
+    async def delete_session(self, session_key: str) -> None:
+        """
+        删除会话的所有记录
+        
+        Args:
+            session_key: 会话标识
+        """
+        if not self._client:
+            raise RuntimeError("Redis client not connected")
+        
+        await self._client.delete(
+            f"session:{session_key}:en",
+            f"session:{session_key}:zh",
+        )
 
 
 # 全局实例
